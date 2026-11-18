@@ -1,0 +1,400 @@
+=== FILE: app/build.gradle.kts ===
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.example.voiceassistant"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.example.voiceassistant"
+        minSdk = 26
+        targetSdk = 34
+        versionCode = 2
+        versionName = "0.2"
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    implementation("net.java.dev.jna:jna:5.13.0@aar")
+    implementation("com.alphacephei:vosk-android:0.3.47")
+}
+
+=== FILE: app/src/main/AndroidManifest.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <application
+        android:label="Voice Assistant"
+        android:allowBackup="false"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+
+=== FILE: app/src/main/java/com/example/voiceassistant/RingView.kt ===
+package com.example.voiceassistant
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.DashPathEffect
+import android.graphics.Paint
+import android.graphics.RectF
+import android.view.View
+import kotlin.math.min
+import kotlin.math.sin
+
+class RingView(context: Context) : View(context) {
+    var mode: Int = 0
+
+    var active: Boolean = false
+        set(v) {
+            field = v
+            alpha = if (v) 1f else 0.4f
+            invalidate()
+        }
+
+    private fun dpf(v: Float): Float = v * resources.displayMetrics.density
+
+    private val p1 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dpf(1.5f)
+        color = Color.parseColor("#378ADD")
+        pathEffect = DashPathEffect(floatArrayOf(dpf(8f), dpf(6f)), 0f)
+    }
+    private val p2 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dpf(4f)
+        strokeCap = Paint.Cap.ROUND
+        color = Color.parseColor("#378ADD")
+    }
+    private val p3 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dpf(4f)
+        strokeCap = Paint.Cap.ROUND
+        color = Color.parseColor("#85B7EB")
+    }
+    private val pf = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.parseColor("#E6F1FB")
+    }
+    private val pt = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#0C447C")
+        textAlign = Paint.Align.CENTER
+        textSize = dpf(28f)
+    }
+
+    private var a1 = 0f
+    private var a2 = 0f
+    private var last = 0L
+    private val rect = RectF()
+
+    init {
+        alpha = 0.4f
+    }
+
+    override fun onDraw(c: Canvas) {
+        val now = System.nanoTime()
+        val dt = if (last == 0L) 0f else (now - last) / 1e9f
+        last = now
+        val s1 = if (mode == 1) 120f else 25f
+        val s2 = when (mode) {
+            1 -> 300f
+            2 -> 80f
+            else -> 50f
+        }
+        if (active) {
+            a1 += s1 * dt
+            a2 -= s2 * dt
+        }
+        val cx = width / 2f
+        val cy = height / 2f
+        val r = min(width, height) / 2f - dpf(6f)
+
+        c.save()
+        c.rotate(a1, cx, cy)
+        c.drawCircle(cx, cy, r, p1)
+        c.restore()
+
+        val r2 = r * 0.82f
+        rect.set(cx - r2, cy - r2, cx + r2, cy + r2)
+        c.drawArc(rect, a2, 100f, false, p2)
+        c.drawArc(rect, a2 + 180f, 100f, false, p3)
+
+        val pulse = if (mode == 2) 1f + 0.06f * sin(now / 1e9 * 8.0).toFloat() else 1f
+        c.drawCircle(cx, cy, r * 0.5f * pulse, pf)
+        c.drawText("AI", cx, cy + pt.textSize / 3f, pt)
+
+        if (active) postInvalidateOnAnimation()
+    }
+}
+
+=== FILE: app/src/main/java/com/example/voiceassistant/MainActivity.kt ===
+package com.example.voiceassistant
+
+import android.Manifest
+import android.app.Activity
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.os.Bundle
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.Switch
+import android.widget.TextView
+import android.widget.Toast
+import org.json.JSONObject
+import org.vosk.Model
+import org.vosk.Recognizer
+import org.vosk.android.RecognitionListener
+import org.vosk.android.SpeechService
+import java.io.File
+import java.util.zip.ZipInputStream
+
+class MainActivity : Activity(), RecognitionListener {
+    private lateinit var ring: RingView
+    private lateinit var master: Switch
+    private lateinit var caption: TextView
+    private lateinit var heard: TextView
+    private lateinit var bar: ProgressBar
+    private lateinit var dlBtn: Button
+
+    private var model: Model? = null
+    private var service: SpeechService? = null
+    private var dl: ModelDownloader? = null
+
+    private val modelName = "vosk-model-small-hi-0.22"
+    private val modelUrl = "https://alphacephei.com/vosk/models/vosk-model-small-hi-0.22.zip"
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    private fun modelsDir(): File = File(getExternalFilesDir(null) ?: filesDir, "models")
+    private fun modelReady(): Boolean = File(modelsDir(), "$modelName/am").exists()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setBackgroundColor(Color.WHITE)
+        root.setPadding(dp(16), dp(40), dp(16), dp(16))
+
+        val top = LinearLayout(this)
+        top.orientation = LinearLayout.HORIZONTAL
+        top.gravity = Gravity.CENTER_VERTICAL
+        val title = TextView(this)
+        title.text = "Live"
+        title.textSize = 20f
+        master = Switch(this)
+        top.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        top.addView(master, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(top, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        ring = RingView(this)
+        val lp = LinearLayout.LayoutParams(dp(260), dp(260))
+        lp.gravity = Gravity.CENTER_HORIZONTAL
+        lp.topMargin = dp(24)
+        root.addView(ring, lp)
+
+        caption = TextView(this)
+        caption.gravity = Gravity.CENTER
+        caption.textSize = 16f
+        caption.text = if (modelReady()) "बंद है। ऊपर का स्विच चालू करें" else "पहले आवाज़ का मॉडल डाउनलोड करें"
+        val cp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        cp.topMargin = dp(16)
+        root.addView(caption, cp)
+
+        heard = TextView(this)
+        heard.gravity = Gravity.CENTER
+        heard.textSize = 18f
+        heard.minLines = 3
+        val hp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        hp.topMargin = dp(12)
+        root.addView(heard, hp)
+
+        bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        bar.max = 1000
+        bar.visibility = View.GONE
+        root.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        dlBtn = Button(this)
+        dlBtn.text = "आवाज़ मॉडल डाउनलोड करें (लगभग 42 MB)"
+        dlBtn.visibility = if (modelReady()) View.GONE else View.VISIBLE
+        root.addView(dlBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        setContentView(root)
+
+        master.setOnCheckedChangeListener { _, on ->
+            if (on) startListening() else stopListening()
+        }
+        dlBtn.setOnClickListener { startDownload() }
+    }
+
+    private fun startDownload() {
+        val dir = modelsDir()
+        dir.mkdirs()
+        if (dir.usableSpace < 300L * 1024 * 1024) {
+            caption.text = "जगह कम है, कम से कम 300 MB खाली करें"
+            return
+        }
+        dlBtn.isEnabled = false
+        bar.visibility = View.VISIBLE
+        val d = ModelDownloader(dir)
+        dl = d
+        Thread {
+            val zipName = "$modelName.zip"
+            val ok = d.download(modelUrl, zipName) { msg, done, total ->
+                runOnUiThread {
+                    if (total > 0) {
+                        bar.progress = (done * 1000 / total).toInt()
+                        caption.text = msg + " (" + (done / 1048576) + " / " + (total / 1048576) + " MB)"
+                    } else {
+                        caption.text = msg
+                    }
+                }
+            }
+            if (!ok) {
+                runOnUiThread { dlBtn.isEnabled = true }
+                return@Thread
+            }
+            runOnUiThread { caption.text = "फ़ाइलें खोल रहा हूँ..." }
+            try {
+                val zip = File(dir, zipName)
+                unzip(zip, dir)
+                zip.delete()
+                runOnUiThread {
+                    bar.visibility = View.GONE
+                    dlBtn.visibility = View.GONE
+                    caption.text = "मॉडल तैयार। ऊपर का स्विच चालू करें"
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    caption.text = "खोलने में एरर: " + e.message
+                    dlBtn.isEnabled = true
+                }
+            }
+        }.start()
+    }
+
+    private fun unzip(zip: File, dest: File) {
+        val destPath = dest.canonicalPath
+        ZipInputStream(zip.inputStream().buffered()).use { zis ->
+            while (true) {
+                val entry = zis.nextEntry ?: break
+                val out = File(dest, entry.name)
+                if (!out.canonicalPath.startsWith(destPath)) {
+                    throw RuntimeException("गलत फ़ाइल पथ")
+                }
+                if (entry.isDirectory) {
+                    out.mkdirs()
+                } else {
+                    out.parentFile?.mkdirs()
+                    out.outputStream().use { o -> zis.copyTo(o) }
+                }
+            }
+        }
+    }
+
+    private fun startListening() {
+        if (!modelReady()) {
+            Toast.makeText(this, "पहले मॉडल डाउनलोड करें", Toast.LENGTH_SHORT).show()
+            master.isChecked = false
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+            master.isChecked = false
+            return
+        }
+        caption.text = "तैयार हो रहा हूँ..."
+        Thread {
+            try {
+                if (model == null) {
+                    model = Model(File(modelsDir(), modelName).absolutePath)
+                }
+                val rec = Recognizer(model, 16000.0f)
+                val s = SpeechService(rec, 16000.0f)
+                service = s
+                s.startListening(this)
+                runOnUiThread {
+                    ring.mode = 0
+                    ring.active = true
+                    caption.text = "सुन रहा हूँ"
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    caption.text = "एरर: " + e.message
+                    master.isChecked = false
+                }
+            }
+        }.start()
+    }
+
+    private fun stopListening() {
+        try {
+            service?.stop()
+            service?.shutdown()
+        } catch (e: Exception) {
+        }
+        service = null
+        ring.active = false
+        caption.text = "बंद है। ऊपर का स्विच चालू करें"
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            master.isChecked = true
+        }
+    }
+
+    override fun onPartialResult(hypothesis: String?) {
+        val t = JSONObject(hypothesis ?: "{}").optString("partial")
+        if (t.isNotEmpty()) runOnUiThread { heard.text = t }
+    }
+
+    override fun onResult(hypothesis: String?) {
+        val t = JSONObject(hypothesis ?: "{}").optString("text")
+        if (t.isNotEmpty()) runOnUiThread { heard.text = "सुना: " + t }
+    }
+
+    override fun onFinalResult(hypothesis: String?) {
+    }
+
+    override fun onError(exception: Exception?) {
+        runOnUiThread { caption.text = "एरर: " + exception?.message }
+    }
+
+    override fun onTimeout() {
+    }
+
+    override fun onDestroy() {
+        dl?.stop = true
+        stopListening()
+        model?.close()
+        super.onDestroy()
+    }
+}
