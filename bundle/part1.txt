@@ -1,0 +1,263 @@
+=== FILE: settings.gradle.kts ===
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "VoiceAssistant"
+include(":app")
+
+=== FILE: build.gradle.kts ===
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+}
+
+=== FILE: gradle.properties ===
+org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+android.useAndroidX=true
+android.nonTransitiveRClass=true
+kotlin.code.style=official
+
+=== FILE: app/build.gradle.kts ===
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.example.voiceassistant"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.example.voiceassistant"
+        minSdk = 26
+        targetSdk = 34
+        versionCode = 1
+        versionName = "0.1"
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+=== FILE: app/src/main/AndroidManifest.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application
+        android:label="Voice Assistant"
+        android:allowBackup="false"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+
+=== FILE: app/src/main/java/com/example/voiceassistant/ModelDownloader.kt ===
+package com.example.voiceassistant
+
+import java.io.File
+import java.io.RandomAccessFile
+import java.net.HttpURLConnection
+import java.net.URL
+
+class ModelDownloader(private val dir: File) {
+    @Volatile
+    var stop = false
+
+    fun download(url: String, name: String, onStatus: (String, Long, Long) -> Unit): Boolean {
+        dir.mkdirs()
+        val finalFile = File(dir, name)
+        if (finalFile.exists() && finalFile.length() > 0) {
+            onStatus("फ़ाइल पहले से मौजूद है", finalFile.length(), finalFile.length())
+            return true
+        }
+        val part = File(dir, "$name.part")
+        var attempt = 0
+        while (!stop && attempt < 12) {
+            attempt++
+            var conn: HttpURLConnection? = null
+            try {
+                val have = if (part.exists()) part.length() else 0L
+                val c = URL(url).openConnection() as HttpURLConnection
+                conn = c
+                c.connectTimeout = 20000
+                c.readTimeout = 20000
+                c.setRequestProperty("User-Agent", "VoiceAssistant/1.0")
+                if (have > 0) c.setRequestProperty("Range", "bytes=$have-")
+                c.connect()
+                val code = c.responseCode
+                if (code == 416) {
+                    part.delete()
+                    continue
+                }
+                if (code != 200 && code != 206) throw RuntimeException("सर्वर कोड $code")
+                val start: Long
+                val total: Long
+                if (code == 206) {
+                    start = have
+                    val range = c.getHeaderField("Content-Range") ?: ""
+                    total = range.substringAfter('/', "").trim().toLongOrNull()
+                        ?: (have + c.contentLengthLong)
+                } else {
+                    start = 0L
+                    total = c.contentLengthLong
+                }
+                RandomAccessFile(part, "rw").use { raf ->
+                    if (start == 0L) raf.setLength(0)
+                    raf.seek(start)
+                    val buf = ByteArray(65536)
+                    var done = start
+                    var last = 0L
+                    c.inputStream.use { input ->
+                        while (!stop) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            raf.write(buf, 0, n)
+                            done += n
+                            val now = System.currentTimeMillis()
+                            if (now - last > 300) {
+                                last = now
+                                onStatus("डाउनलोड हो रहा है", done, total)
+                            }
+                        }
+                    }
+                }
+                if (stop) return false
+                if (total > 0 && part.length() != total) throw RuntimeException("फ़ाइल अधूरी है")
+                if (!part.renameTo(finalFile)) throw RuntimeException("फ़ाइल का नाम नहीं बदल सका")
+                onStatus("पूरा हुआ", finalFile.length(), finalFile.length())
+                return true
+            } catch (e: Exception) {
+                onStatus("एरर: ${e.message}. कोशिश $attempt/12, दोबारा जुड़ रहा हूँ", part.length(), 0L)
+                try {
+                    Thread.sleep(minOf(2000L * attempt, 10000L))
+                } catch (ie: InterruptedException) {
+                }
+            } finally {
+                conn?.disconnect()
+            }
+        }
+        return false
+    }
+}
+
+=== FILE: app/src/main/java/com/example/voiceassistant/MainActivity.kt ===
+package com.example.voiceassistant
+
+import android.app.Activity
+import android.os.Bundle
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
+import java.io.File
+
+class MainActivity : Activity() {
+    private var dl: ModelDownloader? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        val pad = (16 * resources.displayMetrics.density).toInt()
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setPadding(pad, pad * 3, pad, pad)
+
+        val title = TextView(this)
+        title.text = "Voice Assistant (टेस्ट वर्ज़न)"
+        title.textSize = 20f
+
+        val note = TextView(this)
+        note.text = "पहला टेस्ट: ऐप बना या नहीं, और मॉडल डाउनलोड ठीक चल रहा है या नहीं।"
+        note.textSize = 14f
+
+        val url = EditText(this)
+        url.setText(DEFAULT_URL)
+        url.textSize = 12f
+
+        val start = Button(this)
+        start.text = "मॉडल डाउनलोड शुरू करें"
+
+        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        bar.max = 1000
+
+        val status = TextView(this)
+        status.text = "तैयार"
+        status.textSize = 14f
+
+        val mp = ViewGroup.LayoutParams.MATCH_PARENT
+        val wc = ViewGroup.LayoutParams.WRAP_CONTENT
+        for (v in listOf(title, note, url, start, bar, status)) {
+            root.addView(v, LinearLayout.LayoutParams(mp, wc))
+        }
+        setContentView(root)
+
+        start.setOnClickListener {
+            val dir = getExternalFilesDir(null) ?: filesDir
+            if (dir.usableSpace < 300L * 1024 * 1024) {
+                status.text = "जगह कम है, कम से कम 300 MB खाली करें"
+                return@setOnClickListener
+            }
+            dl?.stop = true
+            val d = ModelDownloader(File(dir, "models"))
+            dl = d
+            start.isEnabled = false
+            val link = url.text.toString().trim()
+            val name = link.substringBefore('?').substringAfterLast('/')
+            Thread {
+                val ok = d.download(link, name) { msg, done, total ->
+                    runOnUiThread {
+                        if (total > 0) {
+                            bar.progress = (done * 1000 / total).toInt()
+                            status.text = msg + " (" + (done / 1048576) + " / " + (total / 1048576) + " MB)"
+                        } else {
+                            status.text = msg
+                        }
+                    }
+                }
+                runOnUiThread {
+                    start.isEnabled = true
+                    if (ok) {
+                        bar.progress = 1000
+                        status.text = "पूरा हुआ। फ़ाइल: " + name
+                    }
+                }
+            }.start()
+        }
+    }
+
+    override fun onDestroy() {
+        dl?.stop = true
+        super.onDestroy()
+    }
+
+    companion object {
+        const val DEFAULT_URL =
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"
+    }
+}
